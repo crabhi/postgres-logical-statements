@@ -41,11 +41,11 @@ func main() {
     defer conn.Close(context.Background())
 
     slotName := os.Getenv("REPLICATION_SLOT")
-    if slotName = "" {
+    if slotName == "" {
         log.Fatalln("Set REPLICATION_SLOT to the slot you want to use")
     }
     publication := os.Getenv("PUBLICATION")
-    if publication = "" {
+    if publication == "" {
         log.Fatalln("PUBLICATION unset")
     }
 
@@ -58,15 +58,23 @@ func main() {
     }
     log.Println("SystemID:", sysident.SystemID, "Timeline:", sysident.Timeline, "XLogPos:", sysident.XLogPos, "DBName:", sysident.DBName)
 
-    if os.Getenc("CREATE_SLOT") == "true" {
+    var replStart pglogrepl.LSN
+
+    if os.Getenv("CREATE_SLOT") == "true" {
         slot, err := pglogrepl.CreateReplicationSlot(context.Background(), conn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{})
         if err != nil {
             log.Fatalln("CreateReplicationSlot failed:", err)
         }
         log.Println("Created temporary replication slot:", slotName, slot)
+        replStart, err = pglogrepl.ParseLSN(slot.ConsistentPoint)
+        if err != nil {
+            log.Fatalln("Bad LSN:", slot.ConsistentPoint)
+        }
+    } else {
+        // TODO pg_replication_slots.restart_lsn
     }
 
-    err = pglogrepl.StartReplication(context.Background(), conn, slotName, sysident.XLogPos, pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments})
+    err = pglogrepl.StartReplication(context.Background(), conn, slotName, replStart, pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments})
     if err != nil {
         log.Fatalln("StartReplication failed:", err)
     }
