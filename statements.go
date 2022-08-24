@@ -127,8 +127,8 @@ func main() {
     }
     log.Println("Logical replication started on slot", slotName)
 
-    clientXLogPos := sysident.XLogPos
-    standbyMessageTimeout := time.Second * 10
+    clientXLogPos := replStart
+    standbyMessageTimeout := time.Second * 2
     nextStandbyMessageDeadline := time.Now().Add(standbyMessageTimeout)
     state := newReplstate()
 
@@ -136,7 +136,7 @@ func main() {
         select {
         case sig := <- state.signals:
             pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
-            log.Println("Sent status update, exiting:", sig)
+            log.Printf("Sent status update (%s), exiting: %s", clientXLogPos, sig)
             return
         default:
             // pass
