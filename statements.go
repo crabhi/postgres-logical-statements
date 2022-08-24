@@ -7,9 +7,12 @@ import (
     "context"
     "log"
     "os"
+    "os/signal"
+    "io"
     "time"
     "fmt"
     "strings"
+    "syscall"
 
     "github.com/jackc/pgconn"
     "github.com/jackc/pglogrepl"
@@ -28,6 +31,7 @@ type replstate struct {
     relations map[uint32]*pglogrepl.RelationMessage
     to_execute chan query
     connInfo *pgtype.ConnInfo
+    signals chan os.Signal
 }
 
 
@@ -39,6 +43,17 @@ func main() {
         log.Fatalln("failed to connect to source PostgreSQL server:", err)
     }
     defer conn.Close(context.Background())
+
+    dsn := os.Getenv("SOURCE_CONN")
+    conn_config, err := pgx.ParseDSN(dsn)
+    if err != nil {
+        log.Fatalf("invalid DSN (%s): %s", dsn, err)
+    }
+    srcConn, err := pgx.Connect(conn_config)
+    if err != nil {
+        log.Fatalln("failed to connect to source PostgreSQL server:", err, conn_config)
+    }
+    defer srcConn.Close()
 
     slotName := os.Getenv("REPLICATION_SLOT")
     if slotName == "" {
@@ -60,18 +75,48 @@ func main() {
 
     var replStart pglogrepl.LSN
 
-    if os.Getenv("CREATE_SLOT") == "true" {
+    if os.Getenv("WITH_COPY") == "true" {
         slot, err := pglogrepl.CreateReplicationSlot(context.Background(), conn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{})
         if err != nil {
             log.Fatalln("CreateReplicationSlot failed:", err)
         }
-        log.Println("Created temporary replication slot:", slotName, slot)
+        log.Println("Created replication slot:", slotName, slot)
         replStart, err = pglogrepl.ParseLSN(slot.ConsistentPoint)
         if err != nil {
             log.Fatalln("Bad LSN:", slot.ConsistentPoint)
         }
+
+        rows, err := srcConn.Query("SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = $1", publication)
+        if err != nil {
+            log.Fatalln("Can't select tables from publication")
+        }
+        defer rows.Close()
+
+        var tables []pgx.Identifier
+        for rows.Next() {
+            var schema string
+            var table string
+            err := rows.Scan(&schema, &table)
+            if err != nil {
+                log.Fatalln("Error reading row", err)
+            }
+            tables = append(tables, pgx.Identifier{schema, table})
+        }
+        if rows.Err() != nil {
+            log.Fatalln("Error reading publication tables", err)
+        }
+
+        copyTables(tables, slot.SnapshotName)
     } else {
-        // TODO pg_replication_slots.restart_lsn
+        var restartLsn string
+        err = srcConn.QueryRow("SELECT restart_lsn FROM pg_replication_slots WHERE slot_name=$1", slotName).Scan(&restartLsn)
+        if err != nil {
+            log.Fatalln("failed reading replication slot", slotName, err)
+        }
+        replStart, err = pglogrepl.ParseLSN(restartLsn)
+        if err != nil {
+            log.Fatalln("Bad LSN:", restartLsn)
+        }
     }
 
     err = pglogrepl.StartReplication(context.Background(), conn, slotName, replStart, pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments})
@@ -86,6 +131,12 @@ func main() {
     state := newReplstate()
 
     for {
+        select {
+        case sig := <- state.signals:
+            pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
+            log.Println("Sent status update, exiting:", sig)
+            return
+        }
         if time.Now().After(nextStandbyMessageDeadline) {
             err = pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
             if err != nil {
@@ -308,7 +359,7 @@ func execute(c chan query) {
             }
             tx, err = conn.Begin()
             if err != nil {
-                log.Fatalln("Can't create transaction", err)
+                log.Fatalln("can't create transaction", err)
             }
             defer tx.Rollback()
         case "COMMIT":
@@ -335,6 +386,9 @@ func newReplstate() replstate {
     s.relations = make(map[uint32]*pglogrepl.RelationMessage)
     s.to_execute = c
     s.connInfo = pgtype.NewConnInfo()
+    s.signals = make(chan os.Signal, 1)
+
+    signal.Notify(s.signals, syscall.SIGINT, syscall.SIGTERM)
     return s
 }
 
@@ -377,4 +431,98 @@ func decodeTextColumnData(ci *pgtype.ConnInfo, data []byte, dataType uint32) (in
         return nil, err
     }
     return decoder.(pgtype.Value).Get(), nil
+}
+
+func copyTables(tables []pgx.Identifier, snapshotName string) error {
+    results := make(chan error)
+    for _, table := range tables {
+        go copyTable(table, snapshotName, results)
+    }
+
+    for range tables {
+        err := <-results
+        if err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+func copyTable(table pgx.Identifier, snapshotName string, results chan error) {
+    dsn := os.Getenv("SOURCE_CONN")
+    conn_config, err := pgx.ParseDSN(dsn)
+    if err != nil {
+        log.Fatalf("invalid DSN (%s): %s", dsn, err)
+    }
+    srcConn, err := pgx.Connect(conn_config)
+    if err != nil {
+        log.Fatalln("failed to connect to source PostgreSQL server:", err, conn_config)
+    }
+    defer srcConn.Close()
+
+    dsn = os.Getenv("DEST_CONN")
+    conn_config, err = pgx.ParseDSN(dsn)
+    if err != nil {
+        log.Fatalf("invalid DSN (%s): %s", dsn, err)
+    }
+    dstConn, err := pgx.Connect(conn_config)
+    if err != nil {
+        log.Fatalln("failed to connect to dest PostgreSQL server:", err, conn_config)
+    }
+    defer dstConn.Close()
+
+    rows, err := srcConn.Query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2", table[0], table[1])
+    if err != nil {
+        log.Fatalln("Can't select columns from", table, err)
+    }
+    defer rows.Close()
+
+    var columns []string
+    for rows.Next() {
+        var column string
+        err := rows.Scan(&column)
+        if err != nil {
+            log.Fatalln("Error reading row", err)
+        }
+        columns = append(columns, pgx.Identifier{column}.Sanitize())
+    }
+    if rows.Err() != nil {
+        log.Fatalln("Error reading column names", err)
+    }
+
+    tx, err := srcConn.Begin()
+    if err != nil {
+        log.Fatalln("can't create transaction", err)
+    }
+
+    _, err = tx.Exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+    if err != nil {
+        log.Fatalln("can't create transaction", err)
+    }
+    _, err = tx.Exec("SET TRANSACTION SNAPSHOT '" + snapshotName + "'")  // can't pass as parameter for some reason
+    if err != nil {
+        log.Fatalln("can't set transaction snapshot", err)
+    }
+
+    r, w := io.Pipe()
+    go func() {
+        defer w.Close()
+
+        _, err := tx.CopyToWriter(w, fmt.Sprintf("COPY (SELECT * FROM %s) TO STDOUT", table.Sanitize()))
+        if err != nil {
+            log.Fatalln("Can't copy from table", err)
+        }
+    }()
+
+    _, err = dstConn.Exec("TRUNCATE TABLE " + table.Sanitize())
+    if err != nil {
+        log.Fatalln("can't truncate", err)
+    }
+    rowsCopied, err := dstConn.CopyFromReader(r, fmt.Sprintf("COPY %s FROM STDIN", table.Sanitize()))
+    if err != nil {
+        log.Fatalln("can't copy from", err)
+    }
+
+    log.Printf("Copy finished - table %s (%s)", table, rowsCopied)
+    results <- nil
 }
