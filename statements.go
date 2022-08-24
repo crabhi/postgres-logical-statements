@@ -119,6 +119,8 @@ func main() {
         }
     }
 
+    srcConn.Close()
+
     err = pglogrepl.StartReplication(context.Background(), conn, slotName, replStart, pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments})
     if err != nil {
         log.Fatalln("StartReplication failed:", err)
@@ -136,6 +138,8 @@ func main() {
             pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
             log.Println("Sent status update, exiting:", sig)
             return
+        default:
+            // pass
         }
         if time.Now().After(nextStandbyMessageDeadline) {
             err = pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
